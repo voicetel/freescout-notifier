@@ -48,10 +48,10 @@ func GetOpenTicketsNeedingAttention(db *sql.DB, threshold config.Duration) ([]mo
 		LEFT JOIN customers cust ON c.customer_id = cust.id
 		LEFT JOIN users u ON c.user_id = u.id
 		WHERE c.status = 1  -- Active/Open status
-			AND c.state = 2  -- CHANGED: was 1, now 2 for your FreeScout
+			AND c.state != 3  -- Exclude deleted/trashed tickets
 			AND c.last_reply_from = 1  -- Last reply was from customer
 			AND c.last_reply_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)
-			AND c.last_reply_at > DATE_SUB(NOW(), INTERVAL 7 DAY)  -- Limit to recent tickets
+			AND c.last_reply_at > DATE_SUB(NOW(), INTERVAL 30 DAY)  -- Limit to recent tickets
 		ORDER BY c.last_reply_at ASC
 	`
 
@@ -81,10 +81,10 @@ func GetPendingTicketsNeedingAttention(db *sql.DB, threshold config.Duration) ([
 		LEFT JOIN customers cust ON c.customer_id = cust.id
 		LEFT JOIN users u ON c.user_id = u.id
 		WHERE c.status = 2  -- Pending status
-			AND c.state = 2  -- CHANGED: was 1, now 2 for your FreeScout
+			AND c.state != 3  -- Exclude deleted/trashed tickets
 			AND c.last_reply_from = 2  -- Last reply was from user/agent
 			AND c.last_reply_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)
-			AND c.last_reply_at > DATE_SUB(NOW(), INTERVAL 30 DAY)  -- Limit to recent tickets
+			AND c.last_reply_at > DATE_SUB(NOW(), INTERVAL 60 DAY)  -- Limit to recent tickets
 		ORDER BY c.last_reply_at ASC
 	`
 
