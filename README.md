@@ -439,6 +439,20 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [Go](https://golang.org/) community for the amazing language and ecosystem
 - All contributors who help improve this project
 
+## 🙌 Contributors
+
+We welcome, acknowlege, and appreciate contributors. Thanks to these awesome people for making this project possible:
+
+[Michael Mavroudis](https://github.com/mavroudis)
+
+## 💖 Sponsors
+
+We gratefully acknowledge the support of our amazing sponsors:
+
+| Sponsor | Contribution |
+|---------|--------------|
+| [VoiceTel Communications](http://www.voicetel.com) | Everything :) |
+
 ---
 
 **Made with ❤️ for better customer support**
