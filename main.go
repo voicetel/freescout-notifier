@@ -12,9 +12,23 @@ import (
 	"github.com/voicetel/freescout-notifier/internal/notifier"
 )
 
+// Version information - these will be set at build time via ldflags
+var (
+	Version   = "dev"     // Version number
+	GitCommit = "unknown" // Git commit hash
+	BuildDate = "unknown" // Build date
+	GoVersion = "unknown" // Go version used to build
+)
+
 func main() {
 	// Parse command line flags
 	cfg := config.ParseFlags()
+
+	// Check for version flag before other validation
+	if cfg.ShowVersion {
+		printVersion()
+		os.Exit(0)
+	}
 
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
@@ -27,6 +41,8 @@ func main() {
 
 	if cfg.Verbose {
 		logger.Info("Starting FreeScout Notifier",
+			"version", Version,
+			"git_commit", GitCommit,
 			"business_hours_enabled", cfg.BusinessHours.Enabled,
 			"dry_run", cfg.DryRun,
 		)
@@ -101,6 +117,14 @@ func main() {
 	if cfg.Stats || cfg.Verbose {
 		printRunStats(stats, logger)
 	}
+}
+
+func printVersion() {
+	fmt.Printf("FreeScout Notifier\n")
+	fmt.Printf("Version:    %s\n", Version)
+	fmt.Printf("Git Commit: %s\n", GitCommit)
+	fmt.Printf("Build Date: %s\n", BuildDate)
+	fmt.Printf("Go Version: %s\n", GoVersion)
 }
 
 func checkConnections(cfg *config.Config, logger *logging.Logger) error {

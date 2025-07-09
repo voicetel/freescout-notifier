@@ -42,6 +42,7 @@ type Config struct {
 	InitDB           bool   `json:"-"`
 	StatsOnly        bool   `json:"-"`
 	Cleanup          bool   `json:"-"`
+	ShowVersion      bool   `json:"-"`
 }
 
 type FreeScoutConfig struct {
@@ -71,6 +72,9 @@ func ParseFlags() *Config {
 
 	// Config file flag
 	configFile := flag.String("config-file", "", "Path to JSON configuration file")
+
+	// Version flag
+	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version information and exit")
 
 	// SQLite flags
 	flag.StringVar(&cfg.DBPath, "db-path", "./notifications.db", "Path to SQLite database")
