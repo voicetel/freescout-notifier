@@ -363,11 +363,7 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%d hours %d minutes", hours, minutes)
 }
 
-func TestSlackWebhook(webhookURL string) error {
-	client := slack.NewClient(config.SlackConfig{
-		WebhookURL: webhookURL,
-		Timeout:    config.Duration{Duration: 10 * time.Second},
-	})
-
+func TestSlackWebhook(cfg config.SlackConfig) error {
+	client := slack.NewClient(cfg)
 	return client.SendMessage("🔧 FreeScout Notifier test message - connection successful!")
 }

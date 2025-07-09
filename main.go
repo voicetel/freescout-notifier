@@ -139,10 +139,10 @@ func checkConnections(cfg *config.Config, logger *logging.Logger) error {
 	fsDB.Close()
 	logger.Info("FreeScout database connection successful")
 
-	// Check Slack webhook
+	// Check Slack webhook - FIXED: Pass the entire SlackConfig
 	if cfg.Slack.WebhookURL != "" {
 		logger.Info("Testing Slack webhook...")
-		if err := notifier.TestSlackWebhook(cfg.Slack.WebhookURL); err != nil {
+		if err := notifier.TestSlackWebhook(cfg.Slack); err != nil {
 			return fmt.Errorf("Slack webhook test failed: %w", err)
 		}
 		logger.Info("Slack webhook test successful")
