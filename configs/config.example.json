@@ -1,0 +1,33 @@
+{
+  "db_path": "/var/lib/freescout-notifier/notifications.db",
+  "db_timeout": "5s",
+  "freescout": {
+    "dsn": "freescout_user:your_password@tcp(localhost:3306)/freescout?parseTime=true&timeout=30s",
+    "timeout": "30s",
+    "url": "https://support.yourcompany.com"
+  },
+  "slack": {
+    "webhook_url": "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK",
+    "timeout": "10s",
+    "retry_attempts": 3
+  },
+  "open_threshold": "2h",
+  "pending_threshold": "24h",
+  "cooldown_period": "4h",
+  "max_notifications": 50,
+  "business_hours": {
+    "enabled": true,
+    "start_hour": 9,
+    "end_hour": 17,
+    "timezone": "America/Chicago",
+    "work_days": [1, 2, 3, 4, 5],
+    "notify_on_open": true,
+    "holidays_file": "/etc/freescout-notifier/holidays.json"
+  },
+  "retention_days": 90,
+  "auto_vacuum": false,
+  "dry_run": false,
+  "verbose": false,
+  "log_format": "json",
+  "stats": true
+}
