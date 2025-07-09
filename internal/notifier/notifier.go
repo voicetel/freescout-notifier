@@ -151,7 +151,7 @@ func (n *Notifier) shouldSkipTicket(ticket models.Ticket) (bool, error) {
 
 	// Check cooldown
 	if sentAt.Valid {
-		cooldownExpiry := sentAt.Time.Add(n.config.CooldownPeriod)
+		cooldownExpiry := sentAt.Time.Add(n.config.CooldownPeriod.Duration)
 		if time.Now().Before(cooldownExpiry) {
 			return true, nil // Still in cooldown
 		}
@@ -208,9 +208,9 @@ func (n *Notifier) recordNotification(ticket models.Ticket, status models.Notifi
 		sentAt = sql.NullTime{Time: time.Now(), Valid: true}
 	}
 
-	thresholdMinutes := int(n.config.OpenThreshold.Minutes())
+	thresholdMinutes := int(n.config.OpenThreshold.Duration.Minutes())
 	if ticket.NotificationType == models.PendingNoCustomerResponse {
-		thresholdMinutes = int(n.config.PendingThreshold.Minutes())
+		thresholdMinutes = int(n.config.PendingThreshold.Duration.Minutes())
 	}
 
 	_, err = n.localDB.Exec(query,
@@ -225,7 +225,7 @@ func (n *Notifier) recordNotification(ticket models.Ticket, status models.Notifi
 		string(ticketJSON),
 		queuedAt,
 		sentAt,
-		int(n.config.CooldownPeriod.Seconds()),
+		int(n.config.CooldownPeriod.Duration.Seconds()),
 	)
 
 	return err
@@ -328,7 +328,7 @@ func (n *Notifier) sendQueuedNotifications() (int, error) {
 		}
 	}
 
-	// Log business hours event - FIX: Check error return value
+	// Log business hours event
 	if sent > 0 {
 		logQuery := `
 			INSERT INTO business_hours_log (event_type, notifications_sent)
@@ -366,7 +366,7 @@ func formatDuration(d time.Duration) string {
 func TestSlackWebhook(webhookURL string) error {
 	client := slack.NewClient(config.SlackConfig{
 		WebhookURL: webhookURL,
-		Timeout:    10 * time.Second,
+		Timeout:    config.Duration{Duration: 10 * time.Second},
 	})
 
 	return client.SendMessage("🔧 FreeScout Notifier test message - connection successful!")

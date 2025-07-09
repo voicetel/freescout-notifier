@@ -31,8 +31,7 @@ func ConnectFreeScout(cfg config.FreeScoutConfig) (*sql.DB, error) {
 	return db, nil
 }
 
-// Rest of the file remains the same...
-func GetOpenTicketsNeedingAttention(db *sql.DB, threshold time.Duration) ([]models.Ticket, error) {
+func GetOpenTicketsNeedingAttention(db *sql.DB, threshold config.Duration) ([]models.Ticket, error) {
 	query := `
 		SELECT DISTINCT
 			c.id AS ticket_id,
@@ -56,7 +55,7 @@ func GetOpenTicketsNeedingAttention(db *sql.DB, threshold time.Duration) ([]mode
 		ORDER BY c.last_reply_at ASC
 	`
 
-	rows, err := db.Query(query, int(threshold.Minutes()))
+	rows, err := db.Query(query, int(threshold.Duration.Minutes()))
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
@@ -65,7 +64,7 @@ func GetOpenTicketsNeedingAttention(db *sql.DB, threshold time.Duration) ([]mode
 	return scanTickets(rows, models.OpenNoAgentResponse)
 }
 
-func GetPendingTicketsNeedingAttention(db *sql.DB, threshold time.Duration) ([]models.Ticket, error) {
+func GetPendingTicketsNeedingAttention(db *sql.DB, threshold config.Duration) ([]models.Ticket, error) {
 	query := `
 		SELECT DISTINCT
 			c.id AS ticket_id,
@@ -89,7 +88,7 @@ func GetPendingTicketsNeedingAttention(db *sql.DB, threshold time.Duration) ([]m
 		ORDER BY c.last_reply_at ASC
 	`
 
-	rows, err := db.Query(query, int(threshold.Minutes()))
+	rows, err := db.Query(query, int(threshold.Duration.Minutes()))
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}

@@ -11,8 +11,8 @@ import (
 
 type Config struct {
 	// SQLite
-	DBPath    string        `json:"db_path"`
-	DBTimeout time.Duration `json:"db_timeout"`
+	DBPath    string   `json:"db_path"`
+	DBTimeout Duration `json:"db_timeout"`
 
 	// FreeScout
 	FreeScout FreeScoutConfig `json:"freescout"`
@@ -21,10 +21,10 @@ type Config struct {
 	Slack SlackConfig `json:"slack"`
 
 	// Notification Rules
-	OpenThreshold    time.Duration `json:"open_threshold"`
-	PendingThreshold time.Duration `json:"pending_threshold"`
-	CooldownPeriod   time.Duration `json:"cooldown_period"`
-	MaxNotifications int           `json:"max_notifications"`
+	OpenThreshold    Duration `json:"open_threshold"`
+	PendingThreshold Duration `json:"pending_threshold"`
+	CooldownPeriod   Duration `json:"cooldown_period"`
+	MaxNotifications int      `json:"max_notifications"`
 
 	// Business Hours
 	BusinessHours BusinessHoursConfig `json:"business_hours"`
@@ -46,15 +46,15 @@ type Config struct {
 }
 
 type FreeScoutConfig struct {
-	DSN     string        `json:"dsn"`     // Database connection string
-	Timeout time.Duration `json:"timeout"` // Connection timeout
-	URL     string        `json:"url"`     // Base URL for ticket links
+	DSN     string   `json:"dsn"`     // Database connection string
+	Timeout Duration `json:"timeout"` // Connection timeout
+	URL     string   `json:"url"`     // Base URL for ticket links
 }
 
 type SlackConfig struct {
-	WebhookURL    string        `json:"webhook_url"`
-	Timeout       time.Duration `json:"timeout"`
-	RetryAttempts int           `json:"retry_attempts"`
+	WebhookURL    string   `json:"webhook_url"`
+	Timeout       Duration `json:"timeout"`
+	RetryAttempts int      `json:"retry_attempts"`
 }
 
 type BusinessHoursConfig struct {
@@ -78,22 +78,26 @@ func ParseFlags() *Config {
 
 	// SQLite flags
 	flag.StringVar(&cfg.DBPath, "db-path", "./notifications.db", "Path to SQLite database")
-	flag.DurationVar(&cfg.DBTimeout, "db-timeout", 5*time.Second, "SQLite timeout")
+
+	// Create temporary duration variables for flag parsing
+	var dbTimeout, fsTimeout, slackTimeout, openThreshold, pendingThreshold, cooldownPeriod time.Duration
+
+	flag.DurationVar(&dbTimeout, "db-timeout", 5*time.Second, "SQLite timeout")
 
 	// FreeScout flags - Use DSN instead of individual fields
 	flag.StringVar(&cfg.FreeScout.DSN, "freescout-dsn", "user:password@tcp(localhost:3306)/freescout?parseTime=true&timeout=30s", "FreeScout database DSN (required)")
-	flag.DurationVar(&cfg.FreeScout.Timeout, "freescout-timeout", 30*time.Second, "FreeScout connection timeout")
+	flag.DurationVar(&fsTimeout, "freescout-timeout", 30*time.Second, "FreeScout connection timeout")
 	flag.StringVar(&cfg.FreeScout.URL, "freescout-url", "https://support.example.com", "FreeScout base URL for ticket links (required)")
 
 	// Slack flags
 	flag.StringVar(&cfg.Slack.WebhookURL, "slack-webhook", "", "Slack webhook URL (required)")
-	flag.DurationVar(&cfg.Slack.Timeout, "slack-timeout", 10*time.Second, "Slack request timeout")
+	flag.DurationVar(&slackTimeout, "slack-timeout", 10*time.Second, "Slack request timeout")
 	flag.IntVar(&cfg.Slack.RetryAttempts, "slack-retry-attempts", 3, "Slack retry attempts")
 
 	// Notification rules
-	flag.DurationVar(&cfg.OpenThreshold, "open-threshold", 2*time.Hour, "Time before notifying about open tickets")
-	flag.DurationVar(&cfg.PendingThreshold, "pending-threshold", 24*time.Hour, "Time before notifying about pending tickets")
-	flag.DurationVar(&cfg.CooldownPeriod, "cooldown-period", 4*time.Hour, "Cooldown between notifications for same ticket")
+	flag.DurationVar(&openThreshold, "open-threshold", 2*time.Hour, "Time before notifying about open tickets")
+	flag.DurationVar(&pendingThreshold, "pending-threshold", 24*time.Hour, "Time before notifying about pending tickets")
+	flag.DurationVar(&cooldownPeriod, "cooldown-period", 4*time.Hour, "Cooldown between notifications for same ticket")
 	flag.IntVar(&cfg.MaxNotifications, "max-notifications-per-run", 50, "Maximum notifications per run")
 
 	// Business hours flags
@@ -121,7 +125,15 @@ func ParseFlags() *Config {
 
 	flag.Parse()
 
-	// Load config file if specified
+	// Convert time.Duration to custom Duration after flag parsing
+	cfg.DBTimeout = Duration{Duration: dbTimeout}
+	cfg.FreeScout.Timeout = Duration{Duration: fsTimeout}
+	cfg.Slack.Timeout = Duration{Duration: slackTimeout}
+	cfg.OpenThreshold = Duration{Duration: openThreshold}
+	cfg.PendingThreshold = Duration{Duration: pendingThreshold}
+	cfg.CooldownPeriod = Duration{Duration: cooldownPeriod}
+
+	// Load config file if specified - this will override flag values
 	if *configFile != "" {
 		if err := cfg.LoadFromFile(*configFile); err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading config file: %v\n", err)

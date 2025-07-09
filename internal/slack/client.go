@@ -24,7 +24,7 @@ func NewClient(cfg config.SlackConfig) *Client {
 	return &Client{
 		webhookURL: cfg.WebhookURL,
 		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
+			Timeout: cfg.Timeout.Duration,
 		},
 		retryAttempts: cfg.RetryAttempts,
 	}
