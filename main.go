@@ -36,13 +36,11 @@ func main() {
 	}
 
 	// Set up logging
-	logger := logging.NewLogger(cfg.LogFormat, cfg.Verbose, nil)
+	logger := logging.NewLogger(cfg.LogFormat, cfg.Verbose, nil, Version, GitCommit, BuildDate)
 	logger.SetAsDefault()
 
 	if cfg.Verbose {
 		logger.Info("Starting FreeScout Notifier",
-			"version", Version,
-			"git_commit", GitCommit,
 			"business_hours_enabled", cfg.BusinessHours.Enabled,
 			"dry_run", cfg.DryRun,
 		)
@@ -139,7 +137,7 @@ func checkConnections(cfg *config.Config, logger *logging.Logger) error {
 	fsDB.Close()
 	logger.Info("FreeScout database connection successful")
 
-	// Check Slack webhook - FIXED: Pass the entire SlackConfig
+	// Check Slack webhook
 	if cfg.Slack.WebhookURL != "" {
 		logger.Info("Testing Slack webhook...")
 		if err := notifier.TestSlackWebhook(cfg.Slack); err != nil {
@@ -222,16 +220,14 @@ func printHumanReadableStats(stats map[string]interface{}) {
 }
 
 func printRunStats(stats *models.RunStats, logger *logging.Logger) {
-	statsMap := map[string]interface{}{
+	// Use the logger's structured logging capability
+	logger.LogRunStats(map[string]interface{}{
 		"tickets_checked":      stats.TicketsChecked,
 		"notifications_sent":   stats.NotificationsSent,
 		"notifications_queued": stats.NotificationsQueued,
 		"errors":               stats.Errors,
 		"duration":             stats.Duration.String(),
-	}
-
-	// Use the logger's structured logging capability
-	logger.LogRunStats(statsMap)
+	})
 
 	// Also print human-readable format for console output
 	fmt.Printf("\n=== Run Statistics ===\n")
