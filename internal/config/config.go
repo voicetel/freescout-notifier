@@ -121,7 +121,7 @@ func ParseFlags() *Config {
 	flag.BoolVar(&cfg.CheckConnections, "check-connections", false, "Test connections and exit")
 	flag.BoolVar(&cfg.InitDB, "init-db", false, "Initialize database and exit")
 	flag.BoolVar(&cfg.StatsOnly, "stats-only", false, "Print statistics and exit")
-	flag.BoolVar(&cfg.Cleanup, "cleanup", true, "Clean up old records and exit")
+	flag.BoolVar(&cfg.Cleanup, "cleanup", false, "Clean up old records and exit")
 
 	flag.Parse()
 
