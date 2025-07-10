@@ -248,9 +248,9 @@ func (n *Notifier) formatSlackMessage(ticket models.Ticket) string {
 	}
 
 	timeAgo := formatDuration(time.Duration(ticket.MinutesSinceReply) * time.Minute)
-	ticketURL := fmt.Sprintf("%s/conversation/%d", n.config.FreeScout.URL, ticket.Number)
+	ticketURL := fmt.Sprintf("%s/conversation/%d", n.config.FreeScout.URL, ticket.ID)
 
-	message := fmt.Sprintf("%s Ticket #%d %s\n", emoji, ticket.Number, action)
+	message := fmt.Sprintf("%s Ticket #%d %s\n", emoji, ticket.ID, action)
 	message += fmt.Sprintf("*Subject:* %s\n", ticket.Subject)
 	message += fmt.Sprintf("*Customer:* %s\n", ticket.CustomerName)
 	message += fmt.Sprintf("*Waiting for:* %s for %s\n", waitingFor, timeAgo)
