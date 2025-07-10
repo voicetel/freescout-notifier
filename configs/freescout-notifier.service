@@ -1,0 +1,18 @@
+[Unit]
+Description=FreeScout Notifier Service
+After=network.target mysql.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/freescout-notifier \
+    --freescout-dsn="user:password@tcp(localhost:3306)/freescout?parseTime=true" \
+    --freescout-url="https://support.example.com" \
+    --slack-webhook="https://hooks.slack.com/services/YOUR/WEBHOOK/URL" \
+    --log-format=json
+StandardOutput=journal
+StandardError=journal
+User=freescout
+Group=freescout
+
+[Install]
+WantedBy=multi-user.target
