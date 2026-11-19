@@ -93,8 +93,8 @@ make build
 
 ## ⚙️ Configuration
 
-Configuration comes from flags, a JSON file (`--config-file`), or both — the
-file wins over flags.
+Configuration comes from flags, a JSON file (`--config-file`), or both —
+flags explicitly set on the command line win over the file.
 
 ### Core
 

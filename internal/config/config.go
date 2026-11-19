@@ -137,6 +137,12 @@ func ParseFlags() *Config {
 
 	flag.Parse()
 
+	// Snapshot the flag-derived values so that flags explicitly set on the
+	// command line can be re-applied after the config file is loaded.
+	flagCfg := *cfg
+	var explicitFlags []string
+	flag.Visit(func(f *flag.Flag) { explicitFlags = append(explicitFlags, f.Name) })
+
 	cfg.Slack.Timeout = Duration{Duration: slackTimeout}
 	cfg.PollInterval = Duration{Duration: pollInterval}
 	cfg.CheckInterval = Duration{Duration: checkInterval}
@@ -145,11 +151,66 @@ func ParseFlags() *Config {
 	cfg.PendingThreshold = Duration{Duration: pendingThreshold}
 	cfg.ReminderInterval = Duration{Duration: reminderInterval}
 
-	// A config file overrides flag values.
+	// A config file provides base values; flags explicitly set on the command
+	// line always win over the file.
 	if *configFile != "" {
 		if err := cfg.LoadFromFile(*configFile); err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading config file: %v\n", err)
 			os.Exit(1)
+		}
+		for _, name := range explicitFlags {
+			switch name {
+			case "db-path":
+				cfg.DBPath = flagCfg.DBPath
+			case "freescout-dsn":
+				cfg.FreeScout.DSN = flagCfg.FreeScout.DSN
+			case "freescout-url":
+				cfg.FreeScout.URL = flagCfg.FreeScout.URL
+			case "slack-webhook":
+				cfg.Slack.WebhookURL = flagCfg.Slack.WebhookURL
+			case "slack-timeout":
+				cfg.Slack.Timeout = Duration{Duration: slackTimeout}
+			case "slack-retry-attempts":
+				cfg.Slack.RetryAttempts = flagCfg.Slack.RetryAttempts
+			case "poll-interval":
+				cfg.PollInterval = Duration{Duration: pollInterval}
+			case "check-interval":
+				cfg.CheckInterval = Duration{Duration: checkInterval}
+			case "lookback-window":
+				cfg.LookbackWindow = Duration{Duration: lookbackWindow}
+			case "unanswered-threshold":
+				cfg.UnansweredThreshold = Duration{Duration: unansweredThreshold}
+			case "pending-threshold":
+				cfg.PendingThreshold = Duration{Duration: pendingThreshold}
+			case "reminder-interval":
+				cfg.ReminderInterval = Duration{Duration: reminderInterval}
+			case "max-notifications-per-run":
+				cfg.MaxNotifications = flagCfg.MaxNotifications
+			case "business-hours-enabled":
+				cfg.BusinessHours.Enabled = flagCfg.BusinessHours.Enabled
+			case "business-hours-start":
+				cfg.BusinessHours.StartHour = flagCfg.BusinessHours.StartHour
+			case "business-hours-end":
+				cfg.BusinessHours.EndHour = flagCfg.BusinessHours.EndHour
+			case "business-hours-timezone":
+				cfg.BusinessHours.Timezone = flagCfg.BusinessHours.Timezone
+			case "business-hours-days":
+				cfg.BusinessHours.WorkDays = parseWorkDays(*workDaysStr)
+			case "notify-on-hours-start":
+				cfg.BusinessHours.NotifyOnOpen = flagCfg.BusinessHours.NotifyOnOpen
+			case "holidays-file":
+				cfg.BusinessHours.HolidaysFile = flagCfg.BusinessHours.HolidaysFile
+			case "retention-days":
+				cfg.RetentionDays = flagCfg.RetentionDays
+			case "auto-vacuum":
+				cfg.AutoVacuum = flagCfg.AutoVacuum
+			case "dry-run":
+				cfg.DryRun = flagCfg.DryRun
+			case "verbose":
+				cfg.Verbose = flagCfg.Verbose
+			case "log-format":
+				cfg.LogFormat = flagCfg.LogFormat
+			}
 		}
 	}
 
