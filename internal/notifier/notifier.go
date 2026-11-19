@@ -1,369 +1,476 @@
+// Package notifier contains the monitoring loops and alert dispatch logic.
 package notifier
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/voicetel/freescout-notifier/internal/config"
 	"github.com/voicetel/freescout-notifier/internal/database"
+	"github.com/voicetel/freescout-notifier/internal/logging"
 	"github.com/voicetel/freescout-notifier/internal/models"
 	"github.com/voicetel/freescout-notifier/internal/slack"
 )
 
+// Notifier monitors a FreeScout installation and dispatches Slack alerts:
+//
+//   - new tickets and new customer replies are detected by a fast poller
+//     (near real time) and deduplicated via the local state store;
+//   - active tickets waiting too long for an agent and pending tickets
+//     aging too long are detected by a slower sweep and re-alerted on a
+//     reminder interval until the condition clears;
+//   - outside business hours alerts are queued and flushed when the
+//     business day is open.
 type Notifier struct {
-	fsDB     *sql.DB
-	localDB  *database.DB
-	config   *config.Config
+	fs       *database.FreeScoutDB
+	store    *database.Store
+	cfg      *config.Config
 	slack    *slack.Client
 	bizHours *BusinessHours
+	log      *logging.Logger
 }
 
-func New(fsDB *sql.DB, localDB *database.DB, cfg *config.Config) *Notifier {
+// New builds a Notifier.
+func New(fs *database.FreeScoutDB, store *database.Store, cfg *config.Config, logger *logging.Logger) *Notifier {
 	return &Notifier{
-		fsDB:     fsDB,
-		localDB:  localDB,
-		config:   cfg,
+		fs:       fs,
+		store:    store,
+		cfg:      cfg,
 		slack:    slack.NewClient(cfg.Slack),
 		bizHours: NewBusinessHours(cfg.BusinessHours),
+		log:      logger,
 	}
 }
 
-func (n *Notifier) Run() (*models.RunStats, error) {
+// ConversationEventKey is the dedup key for a new conversation.
+func ConversationEventKey(conversationID int) string {
+	return fmt.Sprintf("conversation:%d", conversationID)
+}
+
+// ThreadEventKey is the dedup key for a customer reply thread.
+func ThreadEventKey(threadID int) string {
+	return fmt.Sprintf("thread:%d", threadID)
+}
+
+// RunDaemon blocks, running the monitoring loops until ctx is cancelled.
+func (n *Notifier) RunDaemon(ctx context.Context) error {
+	n.log.Info("starting notifier daemon",
+		"poll_interval", n.cfg.PollInterval.String(),
+		"check_interval", n.cfg.CheckInterval.String(),
+		"lookback_window", n.cfg.LookbackWindow.String(),
+		"unanswered_threshold", n.cfg.UnansweredThreshold.String(),
+		"pending_threshold", n.cfg.PendingThreshold.String(),
+		"reminder_interval", n.cfg.ReminderInterval.String(),
+		"business_hours", n.cfg.BusinessHours.Enabled,
+		"last_customer_reply_at_column", n.fs.HasLastCustomerReply(),
+		"dry_run", n.cfg.DryRun,
+	)
+
+	n.seedSeenEvents(ctx)
+
+	// Run a full cycle immediately so state is fresh after a restart.
+	startup := &models.CycleStats{}
 	start := time.Now()
-	stats := &models.RunStats{}
+	n.pollNewEvents(ctx, startup)
+	n.checkAging(ctx, startup)
+	n.flushQueue(ctx)
+	startup.Duration = time.Since(start)
+	n.logCycle("startup", startup)
 
-	now := time.Now()
-	isBusinessHours := n.bizHours.IsBusinessHours(now)
-	isStartOfDay := n.bizHours.IsStartOfBusinessDay(now)
+	pollTicker := time.NewTicker(n.cfg.PollInterval.Duration)
+	checkTicker := time.NewTicker(n.cfg.CheckInterval.Duration)
+	defer pollTicker.Stop()
+	defer checkTicker.Stop()
 
-	if n.config.Verbose {
-		log.Printf("Current time: %s", now.Format("2006-01-02 15:04:05"))
-		log.Printf("Is business hours: %t", isBusinessHours)
-		log.Printf("Is start of day: %t", isStartOfDay)
-	}
+	for {
+		select {
+		case <-ctx.Done():
+			n.log.Info("shutdown requested; stopping notifier daemon")
+			return nil
 
-	// If start of business day, process queued notifications first
-	if isStartOfDay {
-		sent, err := n.sendQueuedNotifications()
-		if err != nil {
-			log.Printf("Error sending queued notifications: %v", err)
-			stats.Errors++
-		} else {
-			stats.NotificationsSent += sent
+		case <-pollTicker.C:
+			stats := &models.CycleStats{}
+			start := time.Now()
+			n.pollNewEvents(ctx, stats)
+			n.flushQueue(ctx)
+			stats.Duration = time.Since(start)
+			n.logCycle("poll", stats)
+
+		case <-checkTicker.C:
+			stats := &models.CycleStats{}
+			start := time.Now()
+			n.checkAging(ctx, stats)
+			n.flushQueue(ctx)
+			stats.Duration = time.Since(start)
+			n.logCycle("aging_check", stats)
 		}
 	}
+}
 
-	// Get open tickets needing attention
-	openTickets, err := database.GetOpenTicketsNeedingAttention(n.fsDB, n.config.OpenThreshold)
-	if err != nil {
-		return stats, fmt.Errorf("failed to get open tickets: %w", err)
-	}
-	stats.TicketsChecked += len(openTickets)
+// RunOnce executes a single full monitoring pass and returns. Intended for
+// cron deployments and testing.
+func (n *Notifier) RunOnce(ctx context.Context) (*models.CycleStats, error) {
+	stats := &models.CycleStats{}
+	start := time.Now()
 
-	// Get pending tickets needing attention
-	pendingTickets, err := database.GetPendingTicketsNeedingAttention(n.fsDB, n.config.PendingThreshold)
-	if err != nil {
-		return stats, fmt.Errorf("failed to get pending tickets: %w", err)
-	}
-	stats.TicketsChecked += len(pendingTickets)
-
-	// Process all tickets
-	allTickets := append(openTickets, pendingTickets...)
-
-	for _, ticket := range allTickets {
-		if err := n.processTicket(ticket, isBusinessHours, stats); err != nil {
-			log.Printf("Error processing ticket %d: %v", ticket.ID, err)
-			stats.Errors++
-		}
-	}
+	n.seedSeenEvents(ctx)
+	n.pollNewEvents(ctx, stats)
+	n.checkAging(ctx, stats)
+	n.flushQueue(ctx)
 
 	stats.Duration = time.Since(start)
+	if stats.Errors > 0 {
+		return stats, fmt.Errorf("%d error(s) occurred during the run", stats.Errors)
+	}
 	return stats, nil
 }
 
-func (n *Notifier) processTicket(ticket models.Ticket, isBusinessHours bool, stats *models.RunStats) error {
-	// Check if we should skip this ticket
-	shouldSkip, err := n.shouldSkipTicket(ticket)
+// --- Event detection ------------------------------------------------------
+
+// seedSeenEvents marks the events already present in the lookback window as
+// seen on the very first run, so history is not replayed as a flood of
+// alerts. Later runs rely on the persisted dedup keys, which also gives
+// catch-up coverage for events that arrived while the process was down.
+func (n *Notifier) seedSeenEvents(ctx context.Context) {
+	hasEvents, err := n.store.HasSeenEvents(ctx)
 	if err != nil {
-		return err
+		n.log.LogError("failed to check seen-events state", err)
+		return
 	}
-	if shouldSkip {
-		return nil
+	if hasEvents {
+		return
 	}
 
-	if isBusinessHours {
-		// Send immediately
-		if !n.config.DryRun {
-			if err := n.sendNotification(ticket); err != nil {
-				return err
+	seeded := 0
+	if convs, err := n.fs.FetchNewConversations(ctx, n.cfg.LookbackWindow.Duration); err != nil {
+		n.log.LogError("failed to seed existing conversations", err)
+	} else {
+		for _, t := range convs {
+			if err := n.store.MarkEventSeen(ctx, ConversationEventKey(t.ID), t.ID); err != nil {
+				n.log.LogError("failed to seed conversation event", err, "ticket", t.Number)
+				break
 			}
+			seeded++
 		}
-		if err := n.recordNotification(ticket, models.StatusSent); err != nil {
-			return err
-		}
-		stats.NotificationsSent++
+	}
 
-		if n.config.Verbose {
-			log.Printf("Sent notification for ticket #%d", ticket.Number)
-		}
+	if replies, err := n.fs.FetchCustomerReplies(ctx, n.cfg.LookbackWindow.Duration); err != nil {
+		n.log.LogError("failed to seed existing customer replies", err)
 	} else {
-		// Queue for later
-		if err := n.recordNotification(ticket, models.StatusQueued); err != nil {
-			return err
-		}
-		stats.NotificationsQueued++
-
-		if n.config.Verbose {
-			log.Printf("Queued notification for ticket #%d", ticket.Number)
+		for _, r := range replies {
+			if err := n.store.MarkEventSeen(ctx, ThreadEventKey(r.ThreadID), r.Ticket.ID); err != nil {
+				n.log.LogError("failed to seed reply event", err, "ticket", r.Ticket.Number)
+				break
+			}
+			seeded++
 		}
 	}
 
-	return nil
+	n.log.Info("first run: existing events marked as seen without notifying",
+		"events", seeded, "lookback_window", n.cfg.LookbackWindow.String())
 }
 
-func (n *Notifier) shouldSkipTicket(ticket models.Ticket) (bool, error) {
-	query := `
-		SELECT sent_at, notification_status
-		FROM notifications
-		WHERE ticket_id = ? AND notification_type = ?
-		ORDER BY COALESCE(sent_at, queued_at, first_eligible_at) DESC
-		LIMIT 1
-	`
-
-	var sentAt sql.NullTime
-	var status string
-
-	err := n.localDB.QueryRow(query, ticket.ID, ticket.NotificationType).Scan(&sentAt, &status)
-	if err == sql.ErrNoRows {
-		return false, nil // No previous notification
-	}
+// pollNewEvents detects new conversations and new customer replies.
+func (n *Notifier) pollNewEvents(ctx context.Context, stats *models.CycleStats) {
+	convs, err := n.fs.FetchNewConversations(ctx, n.cfg.LookbackWindow.Duration)
 	if err != nil {
-		return false, err
+		n.log.LogError("failed to fetch new conversations", err)
+		stats.Errors++
 	}
-
-	// If already queued, skip
-	if status == string(models.StatusQueued) {
-		return true, nil
-	}
-
-	// Check cooldown
-	if sentAt.Valid {
-		cooldownExpiry := sentAt.Time.Add(n.config.CooldownPeriod.Duration)
-		if time.Now().Before(cooldownExpiry) {
-			return true, nil // Still in cooldown
+	for _, t := range convs {
+		alert := models.Alert{Type: models.NewTicket, Ticket: t, ReminderNumber: 1}
+		if n.handleNewEvent(ctx, ConversationEventKey(t.ID), alert, stats) {
+			stats.NewTickets++
 		}
 	}
 
-	return false, nil
-}
-
-func (n *Notifier) recordNotification(ticket models.Ticket, status models.NotificationStatus) error {
-	ticketJSON, err := json.Marshal(ticket)
+	replies, err := n.fs.FetchCustomerReplies(ctx, n.cfg.LookbackWindow.Duration)
 	if err != nil {
-		return err
+		n.log.LogError("failed to fetch customer replies", err)
+		stats.Errors++
 	}
-
-	query := `
-		INSERT INTO notifications (
-			ticket_id,
-			notification_type,
-			notification_status,
-			ticket_subject,
-			customer_name,
-			assigned_user,
-			minutes_waiting,
-			threshold_minutes,
-			ticket_data,
-			queued_at,
-			sent_at
-		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(ticket_id, notification_type)
-		DO UPDATE SET
-			notification_status = excluded.notification_status,
-			ticket_subject = excluded.ticket_subject,
-			customer_name = excluded.customer_name,
-			assigned_user = excluded.assigned_user,
-			minutes_waiting = excluded.minutes_waiting,
-			ticket_data = excluded.ticket_data,
-			queued_at = CASE
-				WHEN excluded.notification_status = 'queued' THEN CURRENT_TIMESTAMP
-				ELSE notifications.queued_at
-			END,
-			sent_at = CASE
-				WHEN excluded.notification_status = 'sent' THEN CURRENT_TIMESTAMP
-				ELSE notifications.sent_at
-			END
-		WHERE notifications.sent_at IS NULL
-			OR notifications.sent_at < datetime('now', '-' || ? || ' seconds')
-	`
-
-	var queuedAt, sentAt sql.NullTime
-	if status == models.StatusQueued {
-		queuedAt = sql.NullTime{Time: time.Now(), Valid: true}
-	} else if status == models.StatusSent {
-		sentAt = sql.NullTime{Time: time.Now(), Valid: true}
+	for _, r := range replies {
+		alert := models.Alert{Type: models.CustomerReply, Ticket: r.Ticket, ReminderNumber: 1}
+		if n.handleNewEvent(ctx, ThreadEventKey(r.ThreadID), alert, stats) {
+			stats.CustomerReplies++
+		}
 	}
-
-	thresholdMinutes := int(n.config.OpenThreshold.Duration.Minutes())
-	if ticket.NotificationType == models.PendingNoCustomerResponse {
-		thresholdMinutes = int(n.config.PendingThreshold.Duration.Minutes())
-	}
-
-	_, err = n.localDB.Exec(query,
-		ticket.ID,
-		ticket.NotificationType,
-		status,
-		ticket.Subject,
-		ticket.CustomerName,
-		ticket.AssignedUserName,
-		ticket.MinutesSinceReply,
-		thresholdMinutes,
-		string(ticketJSON),
-		queuedAt,
-		sentAt,
-		int(n.config.CooldownPeriod.Duration.Seconds()),
-	)
-
-	return err
 }
 
-func (n *Notifier) sendNotification(ticket models.Ticket) error {
-	message := n.formatSlackMessage(ticket)
-	return n.slack.SendMessage(message)
-}
-
-func (n *Notifier) formatSlackMessage(ticket models.Ticket) string {
-	emoji := "🚨"
-	action := "needs attention"
-	waitingFor := "agent response"
-
-	if ticket.NotificationType == models.PendingNoCustomerResponse {
-		emoji = "⏳"
-		action = "waiting for customer"
-		waitingFor = "customer response"
+// handleNewEvent dispatches an alert the first time its dedup key is seen.
+//
+// Events are delivered at-most-once: the key is recorded before sending so a
+// failing delivery never produces duplicate alerts on the next poll. Tickets
+// that genuinely need attention are still picked up by the aging sweeps.
+func (n *Notifier) handleNewEvent(ctx context.Context, key string, alert models.Alert, stats *models.CycleStats) bool {
+	seen, err := n.store.IsEventSeen(ctx, key)
+	if err != nil {
+		n.log.LogError("failed to check event state", err, "event", key)
+		stats.Errors++
+		return false
+	}
+	if seen {
+		return false
 	}
 
-	timeAgo := formatDuration(time.Duration(ticket.MinutesSinceReply) * time.Minute)
-	ticketURL := fmt.Sprintf("%s/conversation/%d", n.config.FreeScout.URL, ticket.ID)
+	if err := n.store.MarkEventSeen(ctx, key, alert.Ticket.ID); err != nil {
+		n.log.LogError("failed to record event state", err, "event", key)
+		stats.Errors++
+		return false
+	}
 
-	message := fmt.Sprintf("%s Ticket #%d %s\n", emoji, ticket.ID, action)
-	message += fmt.Sprintf("*Subject:* %s\n", ticket.Subject)
-	message += fmt.Sprintf("*Customer:* %s\n", ticket.CustomerName)
-	message += fmt.Sprintf("*Waiting for:* %s for %s\n", waitingFor, timeAgo)
+	n.dispatch(ctx, alert, stats)
+	return true
+}
 
-	if ticket.AssignedUserName != "" {
-		message += fmt.Sprintf("*Assigned to:* %s\n", ticket.AssignedUserName)
+// --- Aging sweeps ---------------------------------------------------------
+
+// checkAging runs both aging sweeps: unanswered active tickets and aging
+// pending tickets.
+func (n *Notifier) checkAging(ctx context.Context, stats *models.CycleStats) {
+	unanswered, err := n.fs.FetchUnansweredActive(ctx, n.cfg.UnansweredThreshold.Duration)
+	if err != nil {
+		n.log.LogError("failed to fetch unanswered active tickets", err)
+		stats.Errors++
 	} else {
-		message += "*Assigned to:* Unassigned\n"
+		n.processAging(ctx, unanswered, models.UnansweredActive, stats)
 	}
 
-	message += fmt.Sprintf("*View ticket:* <%s|Open in FreeScout>", ticketURL)
-
-	return message
+	pending, err := n.fs.FetchAgingPending(ctx, n.cfg.PendingThreshold.Duration)
+	if err != nil {
+		n.log.LogError("failed to fetch aging pending tickets", err)
+		stats.Errors++
+	} else {
+		n.processAging(ctx, pending, models.AgingPending, stats)
+	}
 }
 
-func (n *Notifier) sendQueuedNotifications() (int, error) {
-	query := `
-		SELECT
-			ticket_id,
-			notification_type,
-			ticket_data
-		FROM notifications
-		WHERE notification_status = 'queued'
-		ORDER BY queued_at ASC
-		LIMIT ?
-	`
+// processAging alerts for every matching ticket that has no reminder state
+// yet or whose reminder interval has elapsed, then clears the state of
+// tickets whose condition has resolved.
+func (n *Notifier) processAging(ctx context.Context, tickets []models.Ticket, alertType models.NotificationType, stats *models.CycleStats) {
+	activeIDs := make([]int, 0, len(tickets))
 
-	rows, err := n.localDB.Query(query, n.config.MaxNotifications)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
+	for _, ticket := range tickets {
+		activeIDs = append(activeIDs, ticket.ID)
 
-	sent := 0
-	for rows.Next() {
-		var ticketID int
-		var notificationType string
-		var ticketData string
-
-		if err := rows.Scan(&ticketID, &notificationType, &ticketData); err != nil {
-			log.Printf("Error scanning queued notification: %v", err)
+		state, err := n.store.GetAlertState(ctx, ticket.ID, alertType)
+		if err != nil {
+			n.log.LogError("failed to load alert state", err, "ticket", ticket.Number)
+			stats.Errors++
 			continue
 		}
 
-		var ticket models.Ticket
-		if err := json.Unmarshal([]byte(ticketData), &ticket); err != nil {
-			log.Printf("Error unmarshaling ticket data: %v", err)
-			continue
-		}
-
-		// Send notification
-		if !n.config.DryRun {
-			if err := n.sendNotification(ticket); err != nil {
-				log.Printf("Error sending queued notification for ticket %d: %v", ticketID, err)
+		reminderNumber := 1
+		if state != nil {
+			if !NeedsReminder(*state, n.cfg.ReminderInterval.Duration, time.Now()) {
 				continue
 			}
+			reminderNumber = state.AlertCount + 1
 		}
 
-		// Update status
-		updateQuery := `
-			UPDATE notifications
-			SET notification_status = 'sent', sent_at = CURRENT_TIMESTAMP
-			WHERE ticket_id = ? AND notification_type = ?
-		`
-		if _, err := n.localDB.Exec(updateQuery, ticketID, notificationType); err != nil {
-			log.Printf("Error updating notification status: %v", err)
+		alert := models.Alert{Type: alertType, Ticket: ticket, ReminderNumber: reminderNumber}
+		if !n.dispatch(ctx, alert, stats) {
+			// Delivery failed; do not record state so the next sweep retries.
 			continue
 		}
 
-		sent++
-
-		// Rate limit
-		if sent < n.config.MaxNotifications {
-			time.Sleep(2 * time.Second)
+		if err := n.store.RecordAlert(ctx, alert); err != nil {
+			n.log.LogError("failed to record alert state", err, "ticket", ticket.Number)
+			stats.Errors++
+		}
+		if reminderNumber > 1 {
+			stats.Reminders++
 		}
 	}
 
-	// Log business hours event
-	if sent > 0 {
-		logQuery := `
-			INSERT INTO business_hours_log (event_type, notifications_sent)
-			VALUES ('burst_sent', ?)
-		`
-		if _, err := n.localDB.Exec(logQuery, sent); err != nil {
-			log.Printf("Warning: failed to log business hours event: %v", err)
-		}
+	resolved, err := n.store.ResolveAlerts(ctx, alertType, activeIDs)
+	if err != nil {
+		n.log.Warn("failed to clear resolved alert states",
+			"error", err, "type", string(alertType))
+	} else if resolved > 0 {
+		n.log.Info("conditions cleared; reminder state reset",
+			"type", string(alertType), "tickets", resolved)
 	}
-
-	return sent, nil
 }
 
-func formatDuration(d time.Duration) string {
-	if d < time.Hour {
-		return fmt.Sprintf("%d minutes", int(d.Minutes()))
+// NeedsReminder reports whether enough time has passed since the last alert
+// to send another reminder.
+func NeedsReminder(state models.AlertState, interval time.Duration, now time.Time) bool {
+	if state.LastAlertAt == nil {
+		return true
 	}
-
-	hours := int(d.Hours())
-	minutes := int(d.Minutes()) % 60
-
-	if hours == 1 {
-		if minutes == 0 {
-			return "1 hour"
-		}
-		return fmt.Sprintf("1 hour %d minutes", minutes)
-	}
-
-	if minutes == 0 {
-		return fmt.Sprintf("%d hours", hours)
-	}
-	return fmt.Sprintf("%d hours %d minutes", hours, minutes)
+	return !now.Before(state.LastAlertAt.Add(interval))
 }
 
-func TestSlackWebhook(cfg config.SlackConfig) error {
-	client := slack.NewClient(cfg)
-	return client.SendMessage("🔧 FreeScout Notifier test message - connection successful!")
+// --- Delivery -------------------------------------------------------------
+
+// dispatch delivers an alert immediately during business hours and queues it
+// otherwise. It reports whether the alert was delivered (sent or queued).
+func (n *Notifier) dispatch(ctx context.Context, alert models.Alert, stats *models.CycleStats) bool {
+	if n.cfg.MaxNotifications > 0 && stats.Sent+stats.Queued >= n.cfg.MaxNotifications {
+		n.log.Warn("max notifications per cycle reached; skipping alert",
+			"ticket", alert.Ticket.Number, "type", string(alert.Type))
+		stats.Skipped++
+		return false
+	}
+
+	if !n.bizHours.IsBusinessHours(time.Now()) {
+		return n.queue(ctx, alert, stats)
+	}
+	return n.send(ctx, alert, stats)
+}
+
+// queue stores an alert for delivery when business hours open. Queued alerts
+// count as delivered for reminder bookkeeping.
+func (n *Notifier) queue(ctx context.Context, alert models.Alert, stats *models.CycleStats) bool {
+	payload, err := json.Marshal(alert)
+	if err != nil {
+		n.log.LogError("failed to serialize queued alert", err, "ticket", alert.Ticket.Number)
+		stats.Errors++
+		return false
+	}
+	if err := n.store.Enqueue(ctx, alert, string(payload)); err != nil {
+		n.log.LogError("failed to queue alert", err, "ticket", alert.Ticket.Number)
+		stats.Errors++
+		return false
+	}
+	if err := n.store.LogNotification(ctx, alert, models.LogQueued); err != nil {
+		n.log.Warn("failed to write notification log", "error", err, "ticket", alert.Ticket.Number)
+	}
+
+	stats.Queued++
+	n.log.Info("outside business hours; notification queued",
+		"ticket", alert.Ticket.Number, "subject", alert.Ticket.Subject,
+		"type", string(alert.Type), "reminder", alert.ReminderNumber)
+	return true
+}
+
+// send delivers an alert to Slack right away.
+func (n *Notifier) send(ctx context.Context, alert models.Alert, stats *models.CycleStats) bool {
+	message := FormatAlert(alert, n.cfg.FreeScout.URL)
+
+	if n.cfg.DryRun {
+		n.log.Info("dry-run: would send notification",
+			"ticket", alert.Ticket.Number, "subject", alert.Ticket.Subject,
+			"type", string(alert.Type), "reminder", alert.ReminderNumber)
+		n.log.Verbose("dry-run message body", "message", message)
+		if err := n.store.LogNotification(ctx, alert, models.LogSent); err != nil {
+			n.log.Warn("failed to write notification log", "error", err, "ticket", alert.Ticket.Number)
+		}
+		stats.Sent++
+		return true
+	}
+
+	if err := n.slack.SendMessage(ctx, message); err != nil {
+		n.log.LogError("failed to send Slack notification", err,
+			"ticket", alert.Ticket.Number, "type", string(alert.Type))
+		if logErr := n.store.LogNotification(ctx, alert, models.LogFailed); logErr != nil {
+			n.log.Warn("failed to write notification log", "error", logErr)
+		}
+		stats.Errors++
+		return false
+	}
+
+	if err := n.store.LogNotification(ctx, alert, models.LogSent); err != nil {
+		n.log.Warn("failed to write notification log", "error", err, "ticket", alert.Ticket.Number)
+	}
+	stats.Sent++
+	n.log.Info("notification sent",
+		"ticket", alert.Ticket.Number, "subject", alert.Ticket.Subject,
+		"type", string(alert.Type), "reminder", alert.ReminderNumber)
+	return true
+}
+
+// flushQueue delivers queued notifications while business hours are open.
+// Failed deliveries stay queued and are retried on a later cycle.
+func (n *Notifier) flushQueue(ctx context.Context) {
+	if !n.cfg.BusinessHours.NotifyOnOpen {
+		return
+	}
+	if !n.bizHours.IsBusinessHours(time.Now()) {
+		return
+	}
+
+	size, err := n.store.QueueSize(ctx)
+	if err != nil {
+		n.log.LogError("failed to read queue size", err)
+		return
+	}
+	if size == 0 {
+		return
+	}
+
+	items, err := n.store.Dequeue(ctx, 0)
+	if err != nil {
+		n.log.LogError("failed to read notification queue", err)
+		return
+	}
+
+	n.log.Info("business hours open; flushing queued notifications", "count", len(items))
+	flushed := 0
+
+	for i, item := range items {
+		if ctx.Err() != nil {
+			return
+		}
+
+		var alert models.Alert
+		if err := json.Unmarshal([]byte(item.Payload), &alert); err != nil {
+			n.log.LogError("dropping queued notification with corrupt payload", err, "id", item.ID)
+			if rmErr := n.store.RemoveQueued(ctx, item.ID); rmErr != nil {
+				n.log.Warn("failed to remove corrupt queue entry", "error", rmErr, "id", item.ID)
+			}
+			continue
+		}
+
+		if n.cfg.DryRun {
+			n.log.Info("dry-run: would flush queued notification",
+				"ticket", alert.Ticket.Number, "type", string(alert.Type))
+		} else if err := n.slack.SendMessage(ctx, FormatAlert(alert, n.cfg.FreeScout.URL)); err != nil {
+			n.log.LogError("failed to flush queued notification; it stays queued for retry", err,
+				"ticket", alert.Ticket.Number, "type", string(alert.Type))
+			continue
+		}
+
+		if err := n.store.RemoveQueued(ctx, item.ID); err != nil {
+			n.log.LogError("failed to remove queued notification", err, "id", item.ID)
+		}
+		if err := n.store.LogNotification(ctx, alert, models.LogSent); err != nil {
+			n.log.Warn("failed to write notification log", "error", err, "ticket", alert.Ticket.Number)
+		}
+		flushed++
+
+		// Space messages out to stay well within Slack webhook limits.
+		if i < len(items)-1 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}
+
+	n.log.Info("queue flush complete", "flushed", flushed, "remaining", len(items)-flushed)
+}
+
+// --- Logging --------------------------------------------------------------
+
+func (n *Notifier) logCycle(cycle string, stats *models.CycleStats) {
+	if stats.IsEmpty() && !n.cfg.Verbose {
+		return
+	}
+	n.log.Info("cycle complete",
+		"cycle", cycle,
+		"new_tickets", stats.NewTickets,
+		"customer_replies", stats.CustomerReplies,
+		"sent", stats.Sent,
+		"queued", stats.Queued,
+		"reminders", stats.Reminders,
+		"skipped", stats.Skipped,
+		"errors", stats.Errors,
+		"duration", stats.Duration.String(),
+	)
 }

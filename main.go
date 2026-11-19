@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/voicetel/freescout-notifier/internal/config"
 	"github.com/voicetel/freescout-notifier/internal/database"
 	"github.com/voicetel/freescout-notifier/internal/logging"
 	"github.com/voicetel/freescout-notifier/internal/models"
 	"github.com/voicetel/freescout-notifier/internal/notifier"
+	"github.com/voicetel/freescout-notifier/internal/slack"
 )
 
 // Version information - these will be set at build time via ldflags
@@ -21,99 +25,91 @@ var (
 )
 
 func main() {
-	// Parse command line flags
 	cfg := config.ParseFlags()
 
-	// Check for version flag before other validation
 	if cfg.ShowVersion {
 		printVersion()
 		os.Exit(0)
 	}
 
-	// Validate configuration
 	if err := cfg.Validate(); err != nil {
-		log.Fatalf("Configuration error: %v", err)
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Set up logging
 	logger := logging.NewLogger(cfg.LogFormat, cfg.Verbose, nil, Version, GitCommit, BuildDate)
 	logger.SetAsDefault()
 
-	if cfg.Verbose {
-		logger.Info("Starting FreeScout Notifier",
-			"business_hours_enabled", cfg.BusinessHours.Enabled,
-			"dry_run", cfg.DryRun,
-		)
-	}
+	// Graceful shutdown on SIGINT/SIGTERM.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// Check connections mode
-	if cfg.CheckConnections {
-		if err := checkConnections(cfg, logger); err != nil {
-			logger.LogError("Connection check failed", err)
-			os.Exit(1)
-		}
-		fmt.Println("All connections successful!")
-		os.Exit(0)
-	}
-
-	// Initialize SQLite database
-	db, err := database.InitSQLite(cfg.DBPath)
+	// Local state store; the schema is created automatically.
+	store, err := database.NewStore(cfg.DBPath)
 	if err != nil {
-		logger.LogError("Failed to initialize SQLite", err)
+		logger.LogError("Failed to initialize state database", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer store.Close()
 
-	// Initialize database schema if requested
-	if cfg.InitDB {
-		if err := database.InitSchema(db); err != nil {
-			logger.LogError("Failed to initialize database schema", err)
+	// Utility modes that only need the local state store.
+	switch {
+	case cfg.InitDB:
+		fmt.Println("Database initialized successfully!")
+		return
+	case cfg.StatsOnly:
+		if err := printStats(ctx, store); err != nil {
+			logger.LogError("Failed to print stats", err)
 			os.Exit(1)
 		}
-		fmt.Println("Database initialized successfully!")
-		os.Exit(0)
-	}
-
-	// Cleanup mode
-	if cfg.Cleanup {
-		if err := performCleanup(db, cfg, logger); err != nil {
+		return
+	case cfg.Cleanup:
+		if err := performCleanup(ctx, store, cfg, logger); err != nil {
 			logger.LogError("Failed to perform cleanup", err)
 			os.Exit(1)
 		}
 		fmt.Println("Cleanup completed successfully!")
-		os.Exit(0)
+		return
 	}
 
-	// Stats only mode
-	if cfg.StatsOnly {
-		if err := printStats(db, logger); err != nil {
-			logger.LogError("Failed to print stats", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Initialize FreeScout connection
-	fsDB, err := database.ConnectFreeScout(cfg.FreeScout)
+	// FreeScout connection.
+	fs, err := database.ConnectFreeScout(ctx, cfg.FreeScout)
 	if err != nil {
 		logger.LogError("Failed to connect to FreeScout", err)
 		os.Exit(1)
 	}
-	defer fsDB.Close()
+	defer fs.Close()
+	logger.Verbose("FreeScout database connected",
+		"last_customer_reply_at_column", fs.HasLastCustomerReply())
 
-	// Create notifier
-	n := notifier.New(fsDB, db, cfg)
-
-	// Run notification check
-	stats, err := n.Run()
-	if err != nil {
-		logger.LogError("Notification run failed", err)
-		os.Exit(1)
+	if cfg.CheckConnections {
+		if err := checkConnections(ctx, cfg, fs, logger); err != nil {
+			logger.LogError("Connection check failed", err)
+			os.Exit(1)
+		}
+		fmt.Println("All connections successful!")
+		return
 	}
 
-	// Print statistics if requested
-	if cfg.Stats || cfg.Verbose {
-		printRunStats(stats, logger)
+	n := notifier.New(fs, store, cfg, logger)
+
+	// Single pass mode (cron-friendly).
+	if cfg.Once {
+		stats, err := n.RunOnce(ctx)
+		if stats != nil {
+			printRunStats(stats, logger)
+		}
+		if err != nil {
+			logger.LogError("Run completed with errors", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Default: run as a daemon until interrupted.
+	if err := n.RunDaemon(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		logger.LogError("Notifier daemon stopped with error", err)
+		os.Exit(1)
 	}
 }
 
@@ -125,131 +121,117 @@ func printVersion() {
 	fmt.Printf("Go Version: %s\n", GoVersion)
 }
 
-func checkConnections(cfg *config.Config, logger *logging.Logger) error {
+func checkConnections(ctx context.Context, cfg *config.Config, fs *database.FreeScoutDB, logger *logging.Logger) error {
 	logger.Info("Checking connections...")
 
-	// Check FreeScout database
 	logger.Info("Testing FreeScout database connection...")
-	fsDB, err := database.ConnectFreeScout(cfg.FreeScout)
-	if err != nil {
+	if err := fs.Ping(ctx); err != nil {
 		return fmt.Errorf("FreeScout connection failed: %w", err)
 	}
-	fsDB.Close()
 	logger.Info("FreeScout database connection successful")
 
-	// Check Slack webhook
 	if cfg.Slack.WebhookURL != "" {
 		logger.Info("Testing Slack webhook...")
-		if err := notifier.TestSlackWebhook(cfg.Slack); err != nil {
+		if err := slack.TestWebhook(ctx, cfg.Slack); err != nil {
 			return fmt.Errorf("Slack webhook test failed: %w", err)
 		}
 		logger.Info("Slack webhook test successful")
+	} else {
+		logger.Info("Slack webhook not configured; skipped")
 	}
 
 	return nil
 }
 
-func printStats(db *database.DB, logger *logging.Logger) error {
-	stats, err := db.GetNotificationStats()
+func printStats(ctx context.Context, store *database.Store) error {
+	stats, err := store.Stats(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get statistics: %w", err)
 	}
-
-	// Always use human-readable format for --stats-only
 	printHumanReadableStats(stats)
 	return nil
 }
 
-func printHumanReadableStats(stats map[string]interface{}) {
+func printHumanReadableStats(stats *models.Stats) {
 	fmt.Printf("\n=== FreeScout Notifier Statistics ===\n\n")
+	fmt.Printf("Total Notifications Sent: %d\n", stats.TotalSent)
+	fmt.Printf("Sent in Last 24 Hours:    %d\n", stats.SentLast24h)
+	fmt.Printf("Failed in Last 24 Hours:  %d\n", stats.FailedLast24h)
+	fmt.Printf("Currently Queued:         %d\n\n", stats.QueuedNow)
 
-	// Total notifications
-	if total, ok := stats["total_notifications"].(int); ok {
-		fmt.Printf("Total Notifications: %d\n\n", total)
-	}
-
-	// By status
-	if statusMap, ok := stats["by_status"].(map[string]int); ok {
-		fmt.Printf("By Status:\n")
-		for status, count := range statusMap {
-			fmt.Printf("  %s: %d\n", status, count)
+	if len(stats.ByType) > 0 {
+		fmt.Printf("Sent by Type:\n")
+		for _, notifType := range []string{
+			string(models.NewTicket),
+			string(models.CustomerReply),
+			string(models.UnansweredActive),
+			string(models.AgingPending),
+		} {
+			if count, ok := stats.ByType[notifType]; ok {
+				fmt.Printf("  %s: %d\n", notifType, count)
+			}
+		}
+		for notifType, count := range stats.ByType {
+			switch models.NotificationType(notifType) {
+			case models.NewTicket, models.CustomerReply, models.UnansweredActive, models.AgingPending:
+			default:
+				fmt.Printf("  %s: %d\n", notifType, count)
+			}
 		}
 		fmt.Println()
 	}
 
-	// By type
-	if typeMap, ok := stats["by_type"].(map[string]int); ok {
-		fmt.Printf("By Type:\n")
-		for notifType, count := range typeMap {
-			fmt.Printf("  %s: %d\n", notifType, count)
+	if len(stats.ActiveReminders) > 0 {
+		fmt.Printf("Tickets Currently Tracked for Reminders:\n")
+		for alertType, count := range stats.ActiveReminders {
+			fmt.Printf("  %s: %d\n", alertType, count)
 		}
 		fmt.Println()
-	}
-
-	// Recent activity
-	if sent24h, ok := stats["sent_last_24h"].(int); ok {
-		fmt.Printf("Sent in Last 24 Hours: %d\n", sent24h)
-	}
-
-	if queueSize, ok := stats["current_queue_size"].(int); ok {
-		fmt.Printf("Current Queue Size: %d\n\n", queueSize)
-	}
-
-	// Business hours stats
-	if burstEvents, ok := stats["burst_events_7d"].(int); ok {
-		if burstSent, ok := stats["burst_notifications_7d"].(int); ok {
-			fmt.Printf("Business Hours Bursts (Last 7 Days):\n")
-			fmt.Printf("  Events: %d\n", burstEvents)
-			fmt.Printf("  Notifications Sent: %d\n\n", burstSent)
-		}
-	}
-
-	// Response time stats
-	if waitStats, ok := stats["response_times_7d"].(map[string]interface{}); ok {
-		fmt.Printf("Response Times (Last 7 Days):\n")
-		if avg, ok := waitStats["average_minutes"].(float64); ok {
-			fmt.Printf("  Average: %.1f minutes\n", avg)
-		}
-		if min, ok := waitStats["minimum_minutes"].(float64); ok {
-			fmt.Printf("  Minimum: %.1f minutes\n", min)
-		}
-		if max, ok := waitStats["maximum_minutes"].(float64); ok {
-			fmt.Printf("  Maximum: %.1f minutes\n", max)
-		}
 	}
 }
 
-func printRunStats(stats *models.RunStats, logger *logging.Logger) {
-	// Use the logger's structured logging capability
+func printRunStats(stats *models.CycleStats, logger *logging.Logger) {
 	logger.LogRunStats(map[string]interface{}{
-		"tickets_checked":      stats.TicketsChecked,
-		"notifications_sent":   stats.NotificationsSent,
-		"notifications_queued": stats.NotificationsQueued,
-		"errors":               stats.Errors,
-		"duration":             stats.Duration.String(),
+		"new_tickets":      stats.NewTickets,
+		"customer_replies": stats.CustomerReplies,
+		"sent":             stats.Sent,
+		"queued":           stats.Queued,
+		"reminders":        stats.Reminders,
+		"skipped":          stats.Skipped,
+		"errors":           stats.Errors,
+		"duration":         stats.Duration.String(),
 	})
 
-	// Also print human-readable format for console output
 	fmt.Printf("\n=== Run Statistics ===\n")
-	fmt.Printf("Tickets checked: %d\n", stats.TicketsChecked)
-	fmt.Printf("Notifications sent: %d\n", stats.NotificationsSent)
-	fmt.Printf("Notifications queued: %d\n", stats.NotificationsQueued)
-	fmt.Printf("Errors: %d\n", stats.Errors)
-	fmt.Printf("Duration: %s\n", stats.Duration)
+	fmt.Printf("New tickets detected:      %d\n", stats.NewTickets)
+	fmt.Printf("Customer replies detected: %d\n", stats.CustomerReplies)
+	fmt.Printf("Notifications sent:        %d\n", stats.Sent)
+	fmt.Printf("Notifications queued:      %d\n", stats.Queued)
+	fmt.Printf("Reminders sent:            %d\n", stats.Reminders)
+	fmt.Printf("Skipped (rate limit):      %d\n", stats.Skipped)
+	fmt.Printf("Errors:                    %d\n", stats.Errors)
+	fmt.Printf("Duration:                  %s\n", stats.Duration)
 }
 
-func performCleanup(db *database.DB, cfg *config.Config, logger *logging.Logger) error {
-	logger.Info("Starting database cleanup",
+func performCleanup(ctx context.Context, store *database.Store, cfg *config.Config, logger *logging.Logger) error {
+	logger.Info("Starting state database cleanup",
 		"retention_days", cfg.RetentionDays,
 		"auto_vacuum", cfg.AutoVacuum,
 	)
 
-	if err := notifier.CleanupOldNotifications(db, cfg.RetentionDays); err != nil {
-		return fmt.Errorf("failed to cleanup old notifications: %w", err)
+	deleted, err := store.Cleanup(ctx, cfg.RetentionDays)
+	if err != nil {
+		return fmt.Errorf("failed to cleanup old state: %w", err)
+	}
+	for table, rows := range deleted {
+		if rows > 0 {
+			logger.Info("Cleaned up old records", "table", table, "rows", rows)
+		}
 	}
 
 	if cfg.AutoVacuum {
-		if err := notifier.VacuumDatabase(db); err != nil {
+		logger.Info("Performing database vacuum...")
+		if err := store.Vacuum(ctx); err != nil {
 			return fmt.Errorf("failed to vacuum database: %w", err)
 		}
 	}

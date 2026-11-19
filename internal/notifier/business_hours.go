@@ -2,59 +2,65 @@ package notifier
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"os"
 	"time"
 
 	"github.com/voicetel/freescout-notifier/internal/config"
 )
 
+// BusinessHours decides whether notifications are delivered immediately or
+// queued until the next business period.
 type BusinessHours struct {
-	enabled      bool
-	startHour    int
-	endHour      int
-	timezone     *time.Location
-	workDays     map[time.Weekday]bool
-	holidays     map[string]bool
-	notifyOnOpen bool
+	enabled   bool
+	startHour int
+	endHour   int
+	timezone  *time.Location
+	workDays  map[time.Weekday]bool
+	holidays  map[string]bool
 }
 
+// HolidaysFile is the JSON layout of the holidays configuration.
 type HolidaysFile struct {
 	Holidays []string `json:"holidays"`
 }
 
+// NewBusinessHours builds the schedule from configuration. An invalid
+// timezone falls back to UTC, and an unusable holidays file is logged and
+// ignored.
 func NewBusinessHours(cfg config.BusinessHoursConfig) *BusinessHours {
 	bh := &BusinessHours{
-		enabled:      cfg.Enabled,
-		startHour:    cfg.StartHour,
-		endHour:      cfg.EndHour,
-		workDays:     make(map[time.Weekday]bool),
-		holidays:     make(map[string]bool),
-		notifyOnOpen: cfg.NotifyOnOpen,
+		enabled:   cfg.Enabled,
+		startHour: cfg.StartHour,
+		endHour:   cfg.EndHour,
+		workDays:  make(map[time.Weekday]bool, len(cfg.WorkDays)),
+		holidays:  make(map[string]bool),
 	}
 
-	// Load timezone
 	loc, err := time.LoadLocation(cfg.Timezone)
 	if err != nil {
+		slog.Warn("invalid business hours timezone, falling back to UTC",
+			"timezone", cfg.Timezone, "error", err)
 		loc = time.UTC
 	}
 	bh.timezone = loc
 
-	// Set work days
 	for _, day := range cfg.WorkDays {
 		bh.workDays[day] = true
 	}
 
-	// Load holidays - FIX: Check error return value
 	if cfg.HolidaysFile != "" {
 		if err := bh.loadHolidays(cfg.HolidaysFile); err != nil {
-			log.Printf("Warning: failed to load holidays file %s: %v", cfg.HolidaysFile, err)
+			slog.Warn("failed to load holidays file",
+				"file", cfg.HolidaysFile, "error", err)
 		}
 	}
 
 	return bh
 }
 
+// IsBusinessHours reports whether t falls inside the configured schedule.
+// When business hours are disabled, every moment counts as business hours.
 func (bh *BusinessHours) IsBusinessHours(t time.Time) bool {
 	if !bh.enabled {
 		return true
@@ -62,36 +68,15 @@ func (bh *BusinessHours) IsBusinessHours(t time.Time) bool {
 
 	localTime := t.In(bh.timezone)
 
-	// Check if holiday
-	dateStr := localTime.Format("2006-01-02")
-	if bh.holidays[dateStr] {
+	if bh.holidays[localTime.Format("2006-01-02")] {
 		return false
 	}
-
-	// Check if work day
 	if !bh.workDays[localTime.Weekday()] {
 		return false
 	}
 
-	// Check if within hours
 	hour := localTime.Hour()
 	return hour >= bh.startHour && hour < bh.endHour
-}
-
-func (bh *BusinessHours) IsStartOfBusinessDay(t time.Time) bool {
-	if !bh.enabled || !bh.notifyOnOpen {
-		return false
-	}
-
-	localTime := t.In(bh.timezone)
-
-	// Must be business hours
-	if !bh.IsBusinessHours(t) {
-		return false
-	}
-
-	// Check if within first 5 minutes of start hour
-	return localTime.Hour() == bh.startHour && localTime.Minute() < 5
 }
 
 func (bh *BusinessHours) loadHolidays(filename string) error {
@@ -108,6 +93,5 @@ func (bh *BusinessHours) loadHolidays(filename string) error {
 	for _, holiday := range hf.Holidays {
 		bh.holidays[holiday] = true
 	}
-
 	return nil
 }

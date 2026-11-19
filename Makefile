@@ -32,12 +32,17 @@ build:
 	@echo "Build complete: $(BUILD_DIR)/$(BINARY_NAME)"
 
 # Build for multiple platforms
-build-all: build-linux build-darwin build-windows
+build-all: build-linux build-linux-arm64 build-darwin build-windows
 
 build-linux:
 	@echo "Building for Linux..."
 	@mkdir -p $(BUILD_DIR)
 	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 main.go
+
+build-linux-arm64:
+	@echo "Building for Linux (arm64)..."
+	@mkdir -p $(BUILD_DIR)
+	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-arm64 main.go
 
 build-darwin:
 	@echo "Building for macOS..."
@@ -67,10 +72,20 @@ test-coverage:
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated: coverage.html"
 
-# Development run with dry-run and verbose flags
+# Development run: single dry-run pass with verbose logging
+FREESCOUT_DSN ?= readonly:password@tcp(localhost:3306)/freescout
+FREESCOUT_URL ?= https://support.example.com
+CONFIG_FILE ?= configs/config.example.json
+
 run-dev:
-	@echo "Running in development mode..."
-	go run $(LDFLAGS) main.go --dry-run --verbose
+	@echo "Running a single dry-run pass..."
+	go run . --once --dry-run --verbose \
+		--freescout-dsn="$(FREESCOUT_DSN)" \
+		--freescout-url="$(FREESCOUT_URL)"
+
+# Run the daemon with a config file
+run: build
+	$(BUILD_DIR)/$(BINARY_NAME) --config-file $(CONFIG_FILE)
 
 # Install dependencies
 install-deps:
@@ -106,17 +121,18 @@ version-binary:
 # Run with example flags
 run-example:
 	$(BUILD_DIR)/$(BINARY_NAME) \
-		--freescout-dsn="readonly:password@tcp(localhost:3306)/freescout?parseTime=true&timeout=30s" \
-		--freescout-url=https://support.example.com \
+		--freescout-dsn="$(FREESCOUT_DSN)" \
+		--freescout-url="$(FREESCOUT_URL)" \
 		--slack-webhook=https://hooks.slack.com/services/YOUR/WEBHOOK/URL \
+		--once \
 		--dry-run \
 		--verbose
 
-# Create a release build (optimized)
+# Create a release build (optimized, static)
 release:
 	@echo "Creating release build..."
 	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 go build -a -installsuffix cgo $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) main.go
+	CGO_ENABLED=0 go build -trimpath $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) main.go
 	@echo "Release build complete: $(BUILD_DIR)/$(BINARY_NAME)"
 
 # Create a release with all platforms
@@ -169,12 +185,14 @@ help:
 	@echo "  build           - Build the binary with version information"
 	@echo "  build-all       - Build for all supported platforms"
 	@echo "  build-linux     - Build for Linux"
+	@echo "  build-linux-arm64 - Build for Linux (arm64)"
 	@echo "  build-darwin    - Build for macOS"
 	@echo "  build-windows   - Build for Windows"
 	@echo "  clean           - Remove build artifacts"
 	@echo "  test            - Run tests"
 	@echo "  test-coverage   - Run tests with coverage report"
-	@echo "  run-dev         - Run in development mode"
+	@echo "  run-dev         - Run a single dry-run pass (FREESCOUT_DSN/FREESCOUT_URL)"
+	@echo "  run             - Run the daemon with CONFIG_FILE"
 	@echo "  install-deps    - Install Go dependencies"
 	@echo "  init-db         - Initialize the database"
 	@echo "  check-connections - Test connections"
