@@ -13,6 +13,7 @@ import (
 	"github.com/voicetel/freescout-notifier/internal/logging"
 	"github.com/voicetel/freescout-notifier/internal/models"
 	"github.com/voicetel/freescout-notifier/internal/notifier"
+	"github.com/voicetel/freescout-notifier/internal/push"
 	"github.com/voicetel/freescout-notifier/internal/slack"
 )
 
@@ -69,6 +70,13 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("Cleanup completed successfully!")
+		return
+	case cfg.TestPush:
+		if err := testPush(ctx, cfg, logger); err != nil {
+			logger.LogError("Push test failed", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Test push sent to topic %q\n", cfg.Push.Topic)
 		return
 	}
 
@@ -140,7 +148,29 @@ func checkConnections(ctx context.Context, cfg *config.Config, fs *database.Free
 		logger.Info("Slack webhook not configured; skipped")
 	}
 
+	if cfg.Push.Enabled {
+		logger.Info("Testing FCM push credentials...")
+		client, err := push.NewClient(ctx, cfg.Push)
+		if err != nil {
+			return fmt.Errorf("FCM push initialization failed: %w", err)
+		}
+		logger.Info("FCM push credentials OK (use --test-push to send a test message)",
+			"topic", client.Topic())
+	} else {
+		logger.Info("Mobile push not enabled; skipped")
+	}
+
 	return nil
+}
+
+// testPush sends a verification message to the configured FCM topic.
+func testPush(ctx context.Context, cfg *config.Config, logger *logging.Logger) error {
+	logger.Info("Sending test push notification...", "topic", cfg.Push.Topic)
+	client, err := push.NewClient(ctx, cfg.Push)
+	if err != nil {
+		return fmt.Errorf("failed to initialize FCM client: %w", err)
+	}
+	return client.Test(ctx, cfg.FreeScout.URL)
 }
 
 func printStats(ctx context.Context, store *database.Store) error {

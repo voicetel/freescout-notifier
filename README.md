@@ -129,6 +129,24 @@ flags explicitly set on the command line win over the file.
 | `--notify-on-hours-start` / `business_hours.notify_on_open` | `true` | Flush the queue while business hours are open |
 | `--holidays-file` / `business_hours.holidays_file` | — | JSON file with `"holidays": ["2026-12-25", …]` |
 
+### Mobile push (VoiceTel Desk app)
+
+Alerts can also be pushed to the private **VoiceTel Desk** Android app
+(`voicetel-desk-android` repo) via **our own Firebase project** — no
+third-party relay. Messages are data-only FCM messages sent to a topic the
+app subscribes to; tapping a notification deep-links to the ticket. Push is
+best-effort: Slack remains the delivery of record.
+
+| JSON key (`push.`) | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Enable FCM delivery |
+| `credentials_file` | — | Firebase service-account key JSON (mode 600) |
+| `topic` | `desk-alerts` | FCM topic the app subscribes to |
+| `alert_types` | all four | Which alert types to push |
+
+Verify end-to-end with `--test-push` (sends a test message and exits; needs
+no FreeScout/Slack config).
+
 ### Operational
 
 | Flag / JSON key | Default | Description |
@@ -137,7 +155,8 @@ flags explicitly set on the command line win over the file.
 | `--dry-run` / `dry_run` | `false` | Do everything except send Slack messages |
 | `--verbose` / `verbose` | `false` | Debug logging |
 | `--log-format` / `log_format` | `text` | `text` or `json` |
-| `--check-connections` | — | Test FreeScout + Slack and exit |
+| `--check-connections` | — | Test FreeScout + Slack (+ FCM credentials when push is enabled) and exit |
+| `--test-push` | — | Send a test push to the configured FCM topic and exit |
 | `--init-db` | — | Create the state database schema and exit |
 | `--stats-only` | — | Print notification statistics and exit |
 | `--cleanup` | — | Delete state older than `--retention-days` and exit |
@@ -242,6 +261,7 @@ freescout-notifier/
 │   ├── logging/                 # slog setup
 │   ├── models/                  # shared types
 │   ├── notifier/                # loops, dispatch, business hours, formatting
+│   ├── push/                    # FCM client for the VoiceTel Desk mobile app
 │   └── slack/                   # webhook client with retries
 └── configs/                     # example config, systemd unit, holidays
 ```

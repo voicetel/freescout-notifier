@@ -107,6 +107,48 @@ func TestFormatAlertAgingPendingUnassigned(t *testing.T) {
 	}
 }
 
+func TestFormatPush(t *testing.T) {
+	ticket := baseTicket()
+	ticket.MinutesWaiting = 132
+
+	cases := []struct {
+		alert     models.Alert
+		wantTitle string
+		wantBody  string
+	}{
+		{
+			models.Alert{Type: models.NewTicket, Ticket: ticket, ReminderNumber: 1},
+			"🆕 New ticket #42",
+			"Cannot connect — Jane Doe (jane@example.com)",
+		},
+		{
+			models.Alert{Type: models.CustomerReply, Ticket: ticket, ReminderNumber: 1},
+			"💬 Customer reply on #42",
+			"Cannot connect — Jane Doe (jane@example.com)",
+		},
+		{
+			models.Alert{Type: models.UnansweredActive, Ticket: ticket, ReminderNumber: 1},
+			"🚨 Ticket #42 unanswered for 2 hours 12 minutes",
+			"Cannot connect — assigned: Agent Smith",
+		},
+		{
+			models.Alert{Type: models.AgingPending, Ticket: ticket, ReminderNumber: 3},
+			"⏳ Ticket #42 pending for 2 hours 12 minutes (reminder #3)",
+			"Cannot connect — waiting on customer",
+		},
+	}
+
+	for _, c := range cases {
+		title, body := FormatPush(c.alert)
+		if title != c.wantTitle {
+			t.Errorf("title = %q, want %q", title, c.wantTitle)
+		}
+		if body != c.wantBody {
+			t.Errorf("body = %q, want %q", body, c.wantBody)
+		}
+	}
+}
+
 func TestTimeAgoJustNow(t *testing.T) {
 	ticket := baseTicket()
 	ticket.MinutesWaiting = 0

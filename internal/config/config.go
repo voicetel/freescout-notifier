@@ -34,6 +34,9 @@ type Config struct {
 	// Business hours
 	BusinessHours BusinessHoursConfig `json:"business_hours"`
 
+	// Mobile push (FCM)
+	Push PushConfig `json:"push"`
+
 	// Maintenance
 	RetentionDays int  `json:"retention_days"`
 	AutoVacuum    bool `json:"auto_vacuum"`
@@ -49,6 +52,7 @@ type Config struct {
 	InitDB           bool `json:"-"`
 	StatsOnly        bool `json:"-"`
 	Cleanup          bool `json:"-"`
+	TestPush         bool `json:"-"`
 	ShowVersion      bool `json:"-"`
 }
 
@@ -75,6 +79,15 @@ type BusinessHoursConfig struct {
 	WorkDays     []time.Weekday `json:"work_days"`
 	NotifyOnOpen bool           `json:"notify_on_open"` // flush queued notifications while business hours are open
 	HolidaysFile string         `json:"holidays_file"`
+}
+
+// PushConfig controls Firebase Cloud Messaging delivery to the VoiceTel Desk
+// mobile app (our own Firebase project; no third-party relay).
+type PushConfig struct {
+	Enabled         bool     `json:"enabled"`
+	CredentialsFile string   `json:"credentials_file"` // Firebase service-account key JSON
+	Topic           string   `json:"topic"`            // FCM topic the app subscribes to (default "desk-alerts")
+	AlertTypes      []string `json:"alert_types"`      // which alert types to push (default: all)
 }
 
 // ParseFlags builds the configuration from CLI flags, optionally overridden
@@ -134,6 +147,7 @@ func ParseFlags() *Config {
 	flag.BoolVar(&cfg.InitDB, "init-db", false, "Initialize the state database and exit")
 	flag.BoolVar(&cfg.StatsOnly, "stats-only", false, "Print statistics and exit")
 	flag.BoolVar(&cfg.Cleanup, "cleanup", false, "Delete state older than --retention-days and exit")
+	flag.BoolVar(&cfg.TestPush, "test-push", false, "Send a test push notification to the configured FCM topic and exit")
 
 	flag.Parse()
 
@@ -275,7 +289,7 @@ func (c *Config) Validate() error {
 
 	// Required fields. Utility modes only touch the local state store and
 	// need no FreeScout or Slack configuration.
-	utilityMode := c.InitDB || c.StatsOnly || c.Cleanup
+	utilityMode := c.InitDB || c.StatsOnly || c.Cleanup || c.TestPush
 	if !utilityMode {
 		if c.FreeScout.DSN == "" {
 			return fmt.Errorf("freescout DSN is required (--freescout-dsn or config file)")
@@ -328,6 +342,32 @@ func (c *Config) Validate() error {
 	}
 	if len(c.BusinessHours.WorkDays) == 0 {
 		return fmt.Errorf("business-hours work days must not be empty")
+	}
+
+	// Mobile push (FCM).
+	if c.TestPush && !c.Push.Enabled {
+		return fmt.Errorf("--test-push requires push notifications to be enabled in the config")
+	}
+	if c.Push.Enabled {
+		if c.Push.CredentialsFile == "" {
+			return fmt.Errorf("push.credentials_file is required when push is enabled")
+		}
+		if _, err := os.Stat(c.Push.CredentialsFile); err != nil {
+			return fmt.Errorf("push credentials file not accessible: %w", err)
+		}
+		if c.Push.Topic == "" {
+			c.Push.Topic = "desk-alerts"
+		}
+		if len(c.Push.AlertTypes) == 0 {
+			c.Push.AlertTypes = []string{"new_ticket", "customer_reply", "unanswered_active", "aging_pending"}
+		}
+		for _, t := range c.Push.AlertTypes {
+			switch t {
+			case "new_ticket", "customer_reply", "unanswered_active", "aging_pending":
+			default:
+				return fmt.Errorf("unknown push alert type %q (want new_ticket, customer_reply, unanswered_active or aging_pending)", t)
+			}
+		}
 	}
 
 	return nil

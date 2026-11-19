@@ -25,6 +25,12 @@
     "notify_on_open": true,
     "holidays_file": "/etc/freescout-notifier/holidays.json"
   },
+  "push": {
+    "enabled": false,
+    "credentials_file": "/etc/freescout-notifier/fcm-service-account.json",
+    "topic": "desk-alerts",
+    "alert_types": ["new_ticket", "customer_reply", "unanswered_active", "aging_pending"]
+  },
   "retention_days": 90,
   "auto_vacuum": true,
   "dry_run": false,

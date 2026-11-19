@@ -50,6 +50,39 @@ func FormatAlert(alert models.Alert, baseURL string) string {
 	return b.String()
 }
 
+// FormatPush renders an alert as a mobile push title and body. The ticket URL
+// is passed separately as the notification's deep link.
+func FormatPush(alert models.Alert) (title, body string) {
+	t := alert.Ticket
+	reminder := ""
+	if alert.ReminderNumber > 1 {
+		reminder = fmt.Sprintf(" (reminder #%d)", alert.ReminderNumber)
+	}
+
+	switch alert.Type {
+	case models.NewTicket:
+		title = fmt.Sprintf("🆕 New ticket #%d%s", t.Number, reminder)
+		body = fmt.Sprintf("%s — %s", t.Subject, t.DisplayCustomer())
+
+	case models.CustomerReply:
+		title = fmt.Sprintf("💬 Customer reply on #%d%s", t.Number, reminder)
+		body = fmt.Sprintf("%s — %s", t.Subject, t.DisplayCustomer())
+
+	case models.UnansweredActive:
+		title = fmt.Sprintf("🚨 Ticket #%d unanswered for %s%s", t.Number, HumanizeMinutes(t.MinutesWaiting), reminder)
+		body = fmt.Sprintf("%s — assigned: %s", t.Subject, t.DisplayAssignee())
+
+	case models.AgingPending:
+		title = fmt.Sprintf("⏳ Ticket #%d pending for %s%s", t.Number, HumanizeMinutes(t.MinutesWaiting), reminder)
+		body = fmt.Sprintf("%s — waiting on customer", t.Subject)
+
+	default:
+		title = fmt.Sprintf("Ticket #%d", t.Number)
+		body = t.Subject
+	}
+	return title, body
+}
+
 // timeAgo renders a minute count as "X ago", or "just now" for fresh events.
 func timeAgo(minutes int) string {
 	if minutes < 1 {

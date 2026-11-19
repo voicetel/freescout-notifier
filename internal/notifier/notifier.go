@@ -11,6 +11,7 @@ import (
 	"github.com/voicetel/freescout-notifier/internal/database"
 	"github.com/voicetel/freescout-notifier/internal/logging"
 	"github.com/voicetel/freescout-notifier/internal/models"
+	"github.com/voicetel/freescout-notifier/internal/push"
 	"github.com/voicetel/freescout-notifier/internal/slack"
 )
 
@@ -28,13 +29,14 @@ type Notifier struct {
 	store    *database.Store
 	cfg      *config.Config
 	slack    *slack.Client
+	push     *push.Client // nil when mobile push is disabled or failed to init
 	bizHours *BusinessHours
 	log      *logging.Logger
 }
 
 // New builds a Notifier.
 func New(fs *database.FreeScoutDB, store *database.Store, cfg *config.Config, logger *logging.Logger) *Notifier {
-	return &Notifier{
+	n := &Notifier{
 		fs:       fs,
 		store:    store,
 		cfg:      cfg,
@@ -42,6 +44,17 @@ func New(fs *database.FreeScoutDB, store *database.Store, cfg *config.Config, lo
 		bizHours: NewBusinessHours(cfg.BusinessHours),
 		log:      logger,
 	}
+	if cfg.Push.Enabled {
+		client, err := push.NewClient(context.Background(), cfg.Push)
+		if err != nil {
+			logger.LogError("mobile push disabled: failed to initialize FCM client", err)
+		} else {
+			n.push = client
+			logger.Info("mobile push enabled",
+				"topic", client.Topic(), "alert_types", cfg.Push.AlertTypes)
+		}
+	}
+	return n
 }
 
 // ConversationEventKey is the dedup key for a new conversation.
@@ -357,6 +370,7 @@ func (n *Notifier) send(ctx context.Context, alert models.Alert, stats *models.C
 			"ticket", alert.Ticket.Number, "subject", alert.Ticket.Subject,
 			"type", string(alert.Type), "reminder", alert.ReminderNumber)
 		n.log.Verbose("dry-run message body", "message", message)
+		n.pushAlert(ctx, alert)
 		if err := n.store.LogNotification(ctx, alert, models.LogSent); err != nil {
 			n.log.Warn("failed to write notification log", "error", err, "ticket", alert.Ticket.Number)
 		}
@@ -374,6 +388,8 @@ func (n *Notifier) send(ctx context.Context, alert models.Alert, stats *models.C
 		return false
 	}
 
+	n.pushAlert(ctx, alert)
+
 	if err := n.store.LogNotification(ctx, alert, models.LogSent); err != nil {
 		n.log.Warn("failed to write notification log", "error", err, "ticket", alert.Ticket.Number)
 	}
@@ -382,6 +398,32 @@ func (n *Notifier) send(ctx context.Context, alert models.Alert, stats *models.C
 		"ticket", alert.Ticket.Number, "subject", alert.Ticket.Subject,
 		"type", string(alert.Type), "reminder", alert.ReminderNumber)
 	return true
+}
+
+// pushAlert delivers the mobile push counterpart of an alert. Push is
+// best-effort: Slack remains the delivery of record, so a failing push never
+// blocks or retries the alert itself.
+func (n *Notifier) pushAlert(ctx context.Context, alert models.Alert) {
+	if n.push == nil || !n.push.ShouldPush(string(alert.Type)) {
+		return
+	}
+
+	title, body := FormatPush(alert)
+	url := alert.Ticket.URL(n.cfg.FreeScout.URL)
+
+	if n.cfg.DryRun {
+		n.log.Verbose("dry-run: would send push notification",
+			"title", title, "body", body, "url", url)
+		return
+	}
+
+	if err := n.push.Send(ctx, title, body, url, string(alert.Type)); err != nil {
+		n.log.Warn("push notification failed; Slack delivery unaffected",
+			"error", err, "ticket", alert.Ticket.Number, "type", string(alert.Type))
+		return
+	}
+	n.log.Verbose("push notification sent",
+		"ticket", alert.Ticket.Number, "type", string(alert.Type))
 }
 
 // flushQueue delivers queued notifications while business hours are open.
@@ -429,10 +471,13 @@ func (n *Notifier) flushQueue(ctx context.Context) {
 		if n.cfg.DryRun {
 			n.log.Info("dry-run: would flush queued notification",
 				"ticket", alert.Ticket.Number, "type", string(alert.Type))
+			n.pushAlert(ctx, alert)
 		} else if err := n.slack.SendMessage(ctx, FormatAlert(alert, n.cfg.FreeScout.URL)); err != nil {
 			n.log.LogError("failed to flush queued notification; it stays queued for retry", err,
 				"ticket", alert.Ticket.Number, "type", string(alert.Type))
 			continue
+		} else {
+			n.pushAlert(ctx, alert)
 		}
 
 		if err := n.store.RemoveQueued(ctx, item.ID); err != nil {

@@ -2,6 +2,8 @@ package config
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -138,6 +140,75 @@ func TestValidateAppliesDefaults(t *testing.T) {
 		cfg.Slack.Timeout.Duration != 10*time.Second || cfg.LogFormat != "text" {
 		t.Errorf("defaults not applied: %+v", cfg)
 	}
+}
+
+func TestValidatePushConfig(t *testing.T) {
+	creds := filepath.Join(t.TempDir(), "service-account.json")
+	if err := os.WriteFile(creds, []byte(`{"type":"service_account"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("disabled needs nothing", func(t *testing.T) {
+		cfg := validConfig()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("push disabled should not require credentials: %v", err)
+		}
+	})
+
+	t.Run("enabled requires credentials file", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Push.Enabled = true
+		cfg.Push.CredentialsFile = filepath.Join(t.TempDir(), "missing.json")
+		if err := cfg.Validate(); err == nil {
+			t.Error("expected error for missing credentials file")
+		}
+	})
+
+	t.Run("enabled applies defaults", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Push.Enabled = true
+		cfg.Push.CredentialsFile = creds
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Push.Topic != "desk-alerts" {
+			t.Errorf("topic = %q, want desk-alerts", cfg.Push.Topic)
+		}
+		if len(cfg.Push.AlertTypes) != 4 {
+			t.Errorf("alert_types = %v, want all four types", cfg.Push.AlertTypes)
+		}
+	})
+
+	t.Run("rejects unknown alert type", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Push.Enabled = true
+		cfg.Push.CredentialsFile = creds
+		cfg.Push.AlertTypes = []string{"new_ticket", "bogus"}
+		if err := cfg.Validate(); err == nil {
+			t.Error("expected error for unknown alert type")
+		}
+	})
+
+	t.Run("test-push requires push enabled", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TestPush = true
+		if err := cfg.Validate(); err == nil {
+			t.Error("expected error when push is disabled")
+		}
+	})
+
+	t.Run("test-push needs no freescout or slack", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TestPush = true
+		cfg.Push.Enabled = true
+		cfg.Push.CredentialsFile = creds
+		cfg.FreeScout.DSN = ""
+		cfg.FreeScout.URL = ""
+		cfg.Slack.WebhookURL = ""
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("test-push should not require FreeScout/Slack: %v", err)
+		}
+	})
 }
 
 func TestDurationJSON(t *testing.T) {
